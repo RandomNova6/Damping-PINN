@@ -4,12 +4,6 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-import torch
-import torch.nn as nn
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-
 class ForceViberationModel(nn.Module):
     def __init__(self,max_theta_data,omega_peak_data):
         super().__init__()
