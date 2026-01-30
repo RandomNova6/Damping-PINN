@@ -3,6 +3,7 @@ import torch.nn as nn
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
 
 class ForceViberationModel(nn.Module):
     def __init__(self,max_theta_data,omega_peak_data):
@@ -20,7 +21,7 @@ class ForceViberationModel(nn.Module):
         real_k = self.J_fixed * (omega_peak_data ** 2)
         
         # 初始 c 设为临界阻尼的 5% (保证有明显的尖峰)
-        real_c = 0.02 * (2 * np.sqrt(self.J_fixed * real_k))
+        real_c = 0.0 * (2 * np.sqrt(self.J_fixed * real_k))
         
         # --- 关键：根据物理公式推算 M0 ---
         # Theta_max = M0 / (c * omega_peak) -> M0 = Theta_max * c * omega_peak
@@ -95,9 +96,9 @@ class PINNLoss():
         
         # 3. 阻尼惩罚 (防止阻尼过大导致曲线变平)
         # 阻尼比 delta = c / (2*sqrt(J*k))，我们希望它保持在欠阻尼状态 (delta < 1)
-        reg_loss = torch.relu(phy_out['delta'] - 0.5) * 10.0 
+        reg_loss = torch.relu(phy_out['delta'] - 0.2) + torch.relu(0.05-phy_out['delta'])
 
-        return data_total + 10.0 * (loss_theta_phy + loss_phi_phy) + 100.0 * loss_omega0 + 1.0*reg_loss
+        return data_total + 30.0 * (loss_theta_phy + loss_phi_phy) + 15.0 * loss_omega0 + 0.0*reg_loss
 # --------------------------
 # 2. 修正后的训练器 (差分学习率)
 # --------------------------
@@ -146,7 +147,7 @@ class PINNTrainer():
             self.optimizer.step()
             self.scheduler.step()
 
-            if epoch % 100 == 0:
+            if epoch % 1000 == 0:
                 with torch.no_grad():
                     phy_out = self.model.physic_model(omega)
                     J_val, c_val, k_val, M0_val = phy_out['params']
@@ -202,23 +203,76 @@ class DataLoader():
         }
     
 def calculate_delta_from_curve(omega_dense, theta_nn):
+    """
+    使用线性插值法精确计算半功率带宽和阻尼比
+    """
     # 1. 找峰值
     idx_max = np.argmax(theta_nn)
     theta_max = theta_nn[idx_max]
     omega_0 = omega_dense[idx_max]
     
-    # 2. 找 0.707 倍高度的频率点
+    # 2. 目标幅值
     target_theta = theta_max / np.sqrt(2)
-    # 找到峰值左侧和右侧最接近 target_theta 的点
-    left_side = theta_nn[:idx_max]
-    right_side = theta_nn[idx_max:]
     
-    omega_1 = omega_dense[np.argmin(np.abs(left_side - target_theta))]
-    omega_2 = omega_dense[idx_max + np.argmin(np.abs(right_side - target_theta))]
+    # 3. 使用线性插值寻找精确交叉点
+    # 将 theta - target_theta 视为函数 f(omega)，寻找零点
     
-    # 3. 计算阻尼比
-    delta_img = (omega_2 - omega_1) / (2 * omega_0)
-    return delta_img, omega_1, omega_2
+    # 左侧搜索 (0 到 idx_max)
+    omega_left = omega_dense[:idx_max]
+    theta_left = theta_nn[:idx_max]
+    # 剔除单调性不好的部分，通常只取峰值左侧单调上升段
+    if len(theta_left) > 1:
+        # 寻找 theta_left 中穿过 target_theta 的位置
+        # 为了鲁棒性，我们反过来插值：omega = f(theta)
+        # 注意：interp1d 需要 x 单调，所以我们要确保 theta 是单调的
+        # 这里简化处理：找最近的两个点做线性插值
+        idx_L = np.argmin(np.abs(theta_left - target_theta))
+        if theta_left[idx_L] < target_theta:
+            p1, p2 = idx_L, idx_L + 1
+        else:
+            p1, p2 = idx_L - 1, idx_L
+            
+        if p1 >= 0 and p2 < len(theta_left):
+            y1, y2 = theta_left[p1], theta_left[p2]
+            x1, x2 = omega_left[p1], omega_left[p2]
+            # 线性插值公式: x = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+            omega_1 = x1 + (target_theta - y1) * (x2 - x1) / (y2 - y1)
+        else:
+            omega_1 = omega_left[idx_L] # 降级处理
+    else:
+        omega_1 = omega_0 # 失败保护
+
+    # 右侧搜索 (idx_max 到 结束)
+    omega_right = omega_dense[idx_max:]
+    theta_right = theta_nn[idx_max:]
+    
+    if len(theta_right) > 1:
+        idx_R = np.argmin(np.abs(theta_right - target_theta))
+        if theta_right[idx_R] < target_theta:
+            p1, p2 = idx_R - 1, idx_R # 右侧是下降的，小于目标值的在后面
+        else:
+            p1, p2 = idx_R, idx_R + 1
+            
+        if p1 >= 0 and p2 < len(theta_right):
+            y1, y2 = theta_right[p1], theta_right[p2]
+            x1, x2 = omega_right[p1], omega_right[p2]
+            omega_2 = x1 + (target_theta - y1) * (x2 - x1) / (y2 - y1)
+        else:
+            omega_2 = omega_right[idx_R]
+    else:
+        omega_2 = omega_0
+
+    # 4. 计算阻尼比
+    # 物理公式: (w2 - w1) / w0 = 2 * delta (对于小阻尼近似)
+    # 或者更精确的: Q = w0 / (w2 - w1), delta = 1 / (2Q)
+    bandwidth = omega_2 - omega_1
+    if bandwidth <= 1e-6:
+        print("警告：带宽计算失败，曲线可能过窄或未覆盖半功率点")
+        return 0.0, omega_0, omega_0
+        
+    delta_calc = bandwidth / (2 * omega_0)
+    
+    return delta_calc, omega_1, omega_2
     
 def visualize_results(model, train_data):
     omega_data = train_data['omega'].detach().cpu().numpy().flatten()
@@ -227,7 +281,7 @@ def visualize_results(model, train_data):
 
     omega_min = np.min(omega_data) * 0.9
     omega_max = np.max(omega_data) * 1.1
-    omega_dense = torch.linspace(omega_min, omega_max, 500).reshape(-1, 1)
+    omega_dense = torch.linspace(omega_min, omega_max, 5000).reshape(-1, 1)
 
     model.eval()
     with torch.no_grad():
@@ -272,17 +326,92 @@ def visualize_results(model, train_data):
     plt.tight_layout()
     plt.show()
 
+def calculate_delta_multi_level(train_data):
+    omega = train_data['omega'].numpy().flatten()
+    theta = train_data['theta'].numpy().flatten()
+    
+    # 1. 为了保证测量精度，先对稀疏的实验数据进行样条插值
+    # 创建高分辨率的插值函数
+    interp_func = interp1d(omega, theta, kind='cubic', bounds_error=False, fill_value=0)
+    
+    omega_dense = np.linspace(omega.min(), omega.max(), 10000)
+    theta_dense = interp_func(omega_dense)
+    
+    # 找到峰值
+    idx_max = np.argmax(theta_dense)
+    theta_max = theta_dense[idx_max]
+    omega_n = omega_dense[idx_max]
+    
+    print(f"\n====== 多截面带宽法 (类逐差法) 分析 ======")
+    print(f"数据峰值: {theta_max:.4f} rad @ {omega_n:.3f} rad/s")
+    print(f"{'Ratio':<10} | {'Width (rad/s)':<15} | {'Calc Delta':<15}")
+    print("-" * 45)
+    
+    deltas = []
+    
+    # 2. 在不同高度比例处进行“切片”
+    # R 是相对于峰值的比例 (0.5 到 0.95)
+    ratios = [0.5, 0.6, 0.7071, 0.8, 0.85, 0.9] 
+    
+    for R in ratios:
+        target_val = theta_max * R
+        
+        # 寻找左右交点
+        # 左侧
+        left_region = theta_dense[:idx_max]
+        left_omega = omega_dense[:idx_max]
+        if len(left_region) > 0:
+            idx_L = np.argmin(np.abs(left_region - target_val))
+            w1 = left_omega[idx_L]
+        else:
+            continue
+            
+        # 右侧
+        right_region = theta_dense[idx_max:]
+        right_omega = omega_dense[idx_max:]
+        if len(right_region) > 0:
+            idx_R = np.argmin(np.abs(right_region - target_val))
+            w2 = right_omega[idx_R]
+        else:
+            continue
+            
+        bandwidth = w2 - w1
+        
+        # 3. 广义带宽公式
+        # Delta = (w2 - w1) / (2 * wn * sqrt(1/R^2 - 1))
+        # 当 R=0.707时，分母 sqrt 项为 1，退化为标准公式
+        if bandwidth > 0:
+            factor = np.sqrt(1/(R**2) - 1)
+            if factor > 1e-6:
+                delta_calc = bandwidth / (2 * omega_n * factor)
+                deltas.append(delta_calc)
+                print(f"{R:<10.4f} | {bandwidth:<15.4f} | {delta_calc:<15.4f}")
+    
+    # 4. 统计结果
+    deltas = np.array(deltas)
+    mean_delta = np.mean(deltas)
+    std_delta = np.std(deltas)
+    
+    print("-" * 45)
+    print(f"统计平均阻尼比 Delta: {mean_delta:.4f} ± {std_delta:.4f}")
+    print("=============================================\n")
+    return mean_delta
+
 if __name__ == "__main__":
     dataLoader = DataLoader('ExperimentData.xlsx')
     train_data = dataLoader.process_data()
-    
+ 
     # 获取数据中的最大振幅
     max_theta = train_data['theta'].max().item()
 
     # 初始化模型时传入 max_theta
-    model = ForceViberationModel(train_data['omega_peak_est'], max_theta)
+    model = ForceViberationModel(max_theta,train_data['omega_peak_est'])
     loss_fn = PINNLoss(train_data['omega_peak_est'])
 
     trainer = PINNTrainer(model, loss_fn)
-    trainer.train(train_data, epochs=25000)
+    trainer.train(train_data, epochs=15000)
     visualize_results(model, train_data)
+
+    # 运行多截面分析
+    calculate_delta_multi_level(train_data)
+
