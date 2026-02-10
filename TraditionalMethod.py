@@ -2,446 +2,251 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt
-from scipy.interpolate import interp1d
+import os
 
-class DataLoader():
-    def __init__(self, data_string):
-        # 从字符串创建数据
-        # 从字符串创建数据，跳过标题行
-        data_lines = data_string.strip().split('\n')
-        data = []
-        for line in data_lines[1:]:  # 跳过第一行标题
-            parts = line.split()
-            if len(parts) >= 3:
-                # 注意：数据顺序是 theta, T, phi
-                data.append([float(parts[0]), float(parts[1]), float(parts[2])])
+class DataLoader:
+    def __init__(self, file_path):
+        self.file_path = file_path
+        self.raw_data = None
         
-        self.raw_data = pd.DataFrame(data, columns=['theta_deg', 'T', 'phi_deg'])
+    def load_data(self):
+        """
+        读取Excel文件
+        Excel应包含表头：theta, T, phi
+        """
+        if not os.path.exists(self.file_path):
+            raise FileNotFoundError(f"找不到文件: {self.file_path}")
+            
+        try:
+            # 读取 Excel 文件
+            df = pd.read_excel(self.file_path)
+            
+            # 检查列名，兼容一些常见的变体
+            required_cols = ['theta', 'T', 'phi']
+            df.columns = [c.strip() for c in df.columns] # 去除列名空格
+            
+            # 简单的列名映射检查
+            if not all(col in df.columns for col in required_cols):
+                print(f"警告: Excel列名应包含 {required_cols}，实际列名为 {df.columns.tolist()}")
+                # 尝试按顺序读取前三列
+                df = df.iloc[:, :3]
+                df.columns = ['theta', 'T', 'phi']
+            
+            self.raw_data = df
+            print(f"成功读取数据，共 {len(df)} 行。")
+            
+        except Exception as e:
+            raise Exception(f"读取Excel失败: {e}")
+
+    def process_data(self):
+        if self.raw_data is None:
+            self.load_data()
+            
+        data = self.raw_data.sort_values(by='T', ascending=False) # T 越大，omega 越小
         
-    def processData(self):
-        data = self.raw_data.sort_values(by='T', ascending=True)
         T = data['T'].values
-        theta_deg = data['theta_deg'].values
-        phi_deg = data['phi_deg'].values
+        theta_deg = data['theta'].values  # 幅值 (度)
+        phi_deg = data['phi'].values      # 相位 (度)
         
-        # 计算角频率 ω = 2π/T
+        # 1. 计算角频率 omega = 2pi / T
         omega = 2 * np.pi / T
         
-        # 将角度转换为弧度
-        theta_rad = theta_deg * np.pi / 180.0
-        phi_rad = phi_deg * np.pi / 180.0
+        # 2. 幅值转换为弧度 (用于拟合计算)
+        theta_rad = np.radians(theta_deg)
         
-        # 调整相位：将相位差转换为相对于驱动力的相位
-        # 在受迫振动中，相位通常在0到π之间变化
-        phi_rad_adjusted = np.where(phi_rad > np.pi, phi_rad - 2*np.pi, phi_rad)
+        # 3. 相位处理
+        # 原始数据通常是直接读数，需转换为弧度
+        # 注意：受迫振动相位差通常定义为滞后，范围 [0, 180] 或 [0, -180]
+        phi_rad = np.radians(phi_deg)
         
-        return omega, theta_rad, phi_rad_adjusted
+        return omega, theta_rad, phi_rad, theta_deg, phi_deg
 
 
 class ForcedVibrationAnalyzer:
-    def __init__(self, omega, amplitude, phase):
-        """
-        初始化分析器
-        omega: 驱动力频率 (rad/s)
-        amplitude: 振动幅值 (rad)
-        phase: 相位差 (rad)
-        """
+    def __init__(self, omega, amplitude_rad, phase_rad, amplitude_deg, phase_deg):
         self.omega = omega
-        self.amplitude = amplitude
-        self.phase = phase
+        self.amp_rad = amplitude_rad
+        self.phase_rad = phase_rad
+        self.amp_deg = amplitude_deg
+        self.phase_deg = phase_deg
         
-    def amplitude_fitting_function(self, omega, A0, omega0, beta):
-        """
-        受迫振动幅频特性理论公式
-        A(ω) = A0 / sqrt((ω0^2 - ω^2)^2 + 4β^2ω^2)
-        """
+        # 存储拟合参数
+        self.popt_amp = None
+        self.omega0_fit = None
+        self.beta_fit = None
+        
+    def amplitude_func(self, omega, A0, omega0, beta):
+        """受迫振动幅频公式 (理论模型)"""
         return A0 / np.sqrt((omega0**2 - omega**2)**2 + 4 * beta**2 * omega**2)
     
-    def phase_fitting_function(self, omega, omega0, beta):
-        """
-        受迫振动相频特性理论公式
-        φ(ω) = arctan(2βω/(ω0^2 - ω^2))
-        注意：需要处理象限问题，使用arctan2
-        """
+    def phase_func(self, omega, omega0, beta):
+        """受迫振动相频公式 (理论模型)"""
+        # arctan2 返回值范围 (-pi, pi]
+        # 物理上相位滞后 phi = arctan(2*beta*omega / (omega0^2 - omega^2))
         return np.arctan2(2 * beta * omega, omega0**2 - omega**2)
-    
-    def fit_amplitude_curve(self, initial_guess=None):
-        """
-        非线性最小二乘法拟合幅频特性曲线
-        """
-        if initial_guess is None:
-            # 初始猜测值: [A0, omega0, beta]
-            max_amp = np.max(self.amplitude)
-            omega_at_max = self.omega[np.argmax(self.amplitude)]
-            initial_guess = [max_amp, omega_at_max, 0.1]
+
+    def fit_parameters(self):
+        """拟合物理参数 omega0, beta"""
+        # 初始猜测
+        max_idx = np.argmax(self.amp_rad)
+        w_max = self.omega[max_idx]
+        A_max = self.amp_rad[max_idx]
         
-        # 设置参数边界
+        # 猜测: A0 约等于 A_max * 2*beta*w0 (近似), omega0 约等于 w_max
+        p0 = [A_max/10, w_max, 0.05] 
         bounds = ([0, 0, 0], [np.inf, np.inf, np.inf])
         
-        # 执行拟合
-        popt, pcov = curve_fit(
-            self.amplitude_fitting_function, 
-            self.omega, 
-            self.amplitude, 
-            p0=initial_guess,
-            bounds=bounds,
-            maxfev=10000
-        )
-        
-        self.amp_params = popt
-        self.amp_cov = pcov
-        
-        # 计算拟合曲线
-        omega_fine = np.linspace(min(self.omega), max(self.omega), 1000)
-        amp_fitted = self.amplitude_fitting_function(omega_fine, *popt)
-        
-        return omega_fine, amp_fitted, popt
-    
-    def analyze_resonance_region(self):
-        """
-        分析共振区域和半功率带
-        """
-        print("="*60)
-        print("共振区域分析")
-        print("="*60)
-        
-        # 找到最大振幅
-        max_amp = np.max(self.amplitude)
-        max_amp_idx = np.argmax(self.amplitude)
-        omega_max = self.omega[max_amp_idx]
-        
-        print(f"最大振幅: {max_amp:.6f} rad")
-        print(f"最大振幅对应的频率: {omega_max:.6f} rad/s")
-        print(f"最大振幅对应的周期: {2*np.pi/omega_max:.6f} s")
-        print(f"最大振幅位置索引: {max_amp_idx}")
-        
-        # 半功率点对应的振幅
-        half_power_amp = max_amp / np.sqrt(2)
-        print(f"\n半功率点振幅 (A_max/√2): {half_power_amp:.6f} rad")
-        
-        # 检查数据点
-        print(f"\n所有数据点振幅:")
-        for i, (w, a) in enumerate(zip(self.omega, self.amplitude)):
-            print(f"  ω={w:.3f} rad/s, A={a:.6f} rad, 是否低于半功率: {a < half_power_amp}")
-        
-        # 寻找半功率点
-        # 使用插值找到精确的半功率点
         try:
-            # 创建插值函数
-            amp_interp = interp1d(self.omega, self.amplitude, kind='cubic', bounds_error=False, fill_value='extrapolate')
+            self.popt_amp, _ = curve_fit(
+                self.amplitude_func, 
+                self.omega, 
+                self.amp_rad, 
+                p0=p0, 
+                bounds=bounds,
+                maxfev=10000
+            )
+            self.omega0_fit = self.popt_amp[1]
+            self.beta_fit = self.popt_amp[2]
             
-            # 在更精细的网格上计算
-            omega_fine = np.linspace(min(self.omega), max(self.omega), 1000)
-            amp_fine = amp_interp(omega_fine)
+            print(f"拟合成功:")
+            print(f"  固有频率 omega0 = {self.omega0_fit:.4f} rad/s")
+            print(f"  阻尼系数 beta   = {self.beta_fit:.4f} s^-1")
+            print(f"  阻尼比 zeta     = {self.beta_fit/self.omega0_fit:.4f}")
             
-            # 找到半功率点的位置
-            half_power_idx = np.where(amp_fine < half_power_amp)[0]
-            
-            if len(half_power_idx) > 0:
-                print(f"\n在插值曲线上找到 {len(half_power_idx)} 个低于半功率的点")
-                
-                # 找到左侧半功率点
-                left_idx = half_power_idx[half_power_idx < np.argmax(amp_fine)]
-                if len(left_idx) > 0:
-                    left_idx = left_idx[-1]
-                    omega_left = omega_fine[left_idx]
-                    print(f"左侧半功率点: ω={omega_left:.6f} rad/s")
-                else:
-                    omega_left = None
-                    print("左侧半功率点: 未找到")
-                
-                # 找到右侧半功率点
-                right_idx = half_power_idx[half_power_idx > np.argmax(amp_fine)]
-                if len(right_idx) > 0:
-                    right_idx = right_idx[0]
-                    omega_right = omega_fine[right_idx]
-                    print(f"右侧半功率点: ω={omega_right:.6f} rad/s")
-                else:
-                    omega_right = None
-                    print("右侧半功率点: 未找到")
-                
-                if omega_left is not None and omega_right is not None:
-                    # 计算半功率带宽
-                    delta_omega = omega_right - omega_left
-                    
-                    # 计算阻尼系数：β = Δω/2
-                    beta_half = delta_omega / 2
-                    
-                    # 计算品质因数
-                    Q_half = omega_max / delta_omega
-                    
-                    print(f"\n半功率带宽 Δω: {delta_omega:.6f} rad/s")
-                    print(f"阻尼系数 β = Δω/2: {beta_half:.6f} rad/s")
-                    print(f"品质因数 Q = ω_max/Δω: {Q_half:.6f}")
-                    
-                    return {
-                        '最大振幅': max_amp,
-                        '共振频率': omega_max,
-                        '左侧半功率频率': omega_left,
-                        '右侧半功率频率': omega_right,
-                        '半功率带宽': delta_omega,
-                        '阻尼系数': beta_half,
-                        '品质因数': Q_half
-                    }
-                else:
-                    print("\n警告：未找到完整的半功率点，可能原因：")
-                    print("1. 数据点不足")
-                    print("2. 系统阻尼太小")
-                    print("3. 数据测量范围不够宽")
-                    
-                    # 尝试直接使用数据点
-                    return self._estimate_from_data_points(max_amp, omega_max, half_power_amp)
-            else:
-                print("\n警告：插值曲线上没有找到低于半功率的点")
-                return self._estimate_from_data_points(max_amp, omega_max, half_power_amp)
-                
         except Exception as e:
-            print(f"\n插值时出错: {e}")
-            return self._estimate_from_data_points(max_amp, omega_max, half_power_amp)
-    
-    def _estimate_from_data_points(self, max_amp, omega_max, half_power_amp):
-        """直接从数据点估计"""
-        print("\n尝试直接从数据点估计...")
-        
-        # 寻找最接近半功率点的数据点
-        left_candidates = []
-        right_candidates = []
-        
-        for i, (w, a) in enumerate(zip(self.omega, self.amplitude)):
-            if a < half_power_amp:
-                if w < omega_max:
-                    left_candidates.append((w, a))
-                else:
-                    right_candidates.append((w, a))
-        
-        print(f"左侧候选点: {len(left_candidates)} 个")
-        print(f"右侧候选点: {len(right_candidates)} 个")
-        
-        if left_candidates and right_candidates:
-            # 选择最接近半功率振幅的点
-            left_w, left_a = max(left_candidates, key=lambda x: x[1])  # 左侧最大值
-            right_w, right_a = min(right_candidates, key=lambda x: x[0])  # 右侧最小值
-            
-            print(f"选择的左侧点: ω={left_w:.6f}, A={left_a:.6f}")
-            print(f"选择的右侧点: ω={right_w:.6f}, A={right_a:.6f}")
-            
-            delta_omega = right_w - left_w
-            beta_est = delta_omega / 2
-            Q_est = omega_max / delta_omega
-            
-            return {
-                '最大振幅': max_amp,
-                '共振频率': omega_max,
-                '左侧频率': left_w,
-                '右侧频率': right_w,
-                '带宽估计': delta_omega,
-                '阻尼系数估计': beta_est,
-                '品质因数估计': Q_est,
-                '备注': '基于最近数据点估计'
-            }
-        else:
-            print("无法找到合适的数据点进行估计")
-            return None
-    
-    def plot_amplitude_phase(self):
+            print(f"拟合失败: {e}")
+            # 如果拟合失败，使用最大值作为估算
+            self.omega0_fit = w_max
+            self.beta_fit = 0.1
+            self.popt_amp = [A_max, w_max, 0.1]
+
+    def visualize_like_target(self):
         """
-        绘制振幅和相位随频率变化的曲线
+        仿照目标格式绘图
         """
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
-        
-        # 幅频特性图
-        ax1.plot(self.omega, self.amplitude, 'bo-', linewidth=2, markersize=8, label='实验数据')
-        max_amp = np.max(self.amplitude)
-        max_amp_idx = np.argmax(self.amplitude)
-        omega_max = self.omega[max_amp_idx]
-        
-        # 标记共振点
-        ax1.plot(omega_max, max_amp, 'r*', markersize=15, label=f'共振点 (ω={omega_max:.3f})')
-        
-        # 绘制半功率线
-        half_power_amp = max_amp / np.sqrt(2)
-        ax1.axhline(y=half_power_amp, color='gray', linestyle='--', alpha=0.7)
-        ax1.text(min(self.omega), half_power_amp*1.05, 
-                f'A_max/√2 = {half_power_amp:.4f}', fontsize=10)
-        
-        ax1.set_xlabel('角频率 ω (rad/s)', fontsize=12)
-        ax1.set_ylabel('振幅 A (rad)', fontsize=12)
-        ax1.set_title('受迫振动幅频特性曲线', fontsize=14)
-        ax1.grid(True, alpha=0.3)
-        ax1.legend()
-        
-        # 相频特性图
-        ax2.plot(self.omega, self.phase, 'go-', linewidth=2, markersize=8, label='实验数据')
-        
-        # 标记共振点附近的相位（理论上在共振点相位=π/2）
-        resonance_phase = self.phase[max_amp_idx] if max_amp_idx < len(self.phase) else None
-        if resonance_phase is not None:
-            ax2.plot(omega_max, resonance_phase, 'r*', markersize=15, 
-                    label=f'共振点相位={resonance_phase:.3f}')
-        
-        ax2.set_xlabel('角频率 ω (rad/s)', fontsize=12)
-        ax2.set_ylabel('相位 φ (rad)', fontsize=12)
-        ax2.set_title('受迫振动相频特性曲线', fontsize=14)
-        ax2.grid(True, alpha=0.3)
-        ax2.legend()
-        
-        plt.tight_layout()
-        plt.show()
-    
-    def plot_detailed_analysis(self):
-        """
-        绘制详细分析图
-        """
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-        
-        # 左图：振幅随频率变化，展示半功率带
-        ax1.plot(self.omega, self.amplitude, 'bo-', linewidth=2, markersize=8)
-        
-        max_amp = np.max(self.amplitude)
-        max_amp_idx = np.argmax(self.amplitude)
-        omega_max = self.omega[max_amp_idx]
-        
-        # 标记共振点
-        ax1.plot(omega_max, max_amp, 'r*', markersize=15)
-        
-        # 半功率线
-        half_power_amp = max_amp / np.sqrt(2)
-        ax1.axhline(y=half_power_amp, color='gray', linestyle='--', alpha=0.7)
-        
-        # 尝试找到半功率点
-        try:
-            amp_interp = interp1d(self.omega, self.amplitude, kind='cubic')
-            omega_fine = np.linspace(min(self.omega), max(self.omega), 1000)
-            amp_fine = amp_interp(omega_fine)
+        if self.omega0_fit is None:
+            self.fit_parameters()
             
-            # 找到半功率点
-            half_idx = np.where(amp_fine < half_power_amp)[0]
-            left_idx = half_idx[half_idx < np.argmax(amp_fine)]
-            right_idx = half_idx[half_idx > np.argmax(amp_fine)]
-            
-            if len(left_idx) > 0 and len(right_idx) > 0:
-                left_idx = left_idx[-1]
-                right_idx = right_idx[0]
-                
-                omega_left = omega_fine[left_idx]
-                omega_right = omega_fine[right_idx]
-                
-                # 绘制半功率点
-                ax1.plot(omega_left, half_power_amp, 'ms', markersize=10)
-                ax1.plot(omega_right, half_power_amp, 'ms', markersize=10)
-                
-                # 绘制带宽线
-                ax1.plot([omega_left, omega_right], 
-                        [half_power_amp, half_power_amp], 'k-', linewidth=3)
-                
-                # 标注
-                ax1.annotate('', xy=(omega_right, half_power_amp), 
-                           xytext=(omega_left, half_power_amp),
-                           arrowprops=dict(arrowstyle='<->', color='purple', lw=2))
-                ax1.text((omega_left+omega_right)/2, half_power_amp*1.1,
-                       f'Δω = {omega_right-omega_left:.3f}',
-                       ha='center', color='purple', fontsize=12, fontweight='bold')
-        except:
-            pass
+        omega0 = self.omega0_fit
+        beta = self.beta_fit
+        A0 = self.popt_amp[0]
         
-        ax1.set_xlabel('角频率 ω (rad/s)', fontsize=12)
-        ax1.set_ylabel('振幅 A (rad)', fontsize=12)
-        ax1.set_title('幅频特性与半功率带', fontsize=14)
-        ax1.grid(True, alpha=0.3)
+        # 1. 生成密集网格用于画平滑曲线
+        omega_min = np.min(self.omega) * 0.8
+        omega_max = np.max(self.omega) * 1.2
+        omega_dense = np.linspace(omega_min, omega_max, 2000)
         
-        # 右图：数据表格和分析结果
-        ax2.axis('tight')
-        ax2.axis('off')
+        # 2. 计算理论曲线
+        # 幅值 (计算出弧度 -> 转角度)
+        amp_theory_rad = self.amplitude_func(omega_dense, A0, omega0, beta)
+        amp_theory_deg = np.degrees(amp_theory_rad)
         
-        # 数据统计
-        info_text = "数据统计:\n"
-        info_text += f"数据点数: {len(self.omega)}\n"
-        info_text += f"频率范围: {min(self.omega):.3f} - {max(self.omega):.3f} rad/s\n"
-        info_text += f"周期范围: {2*np.pi/max(self.omega):.3f} - {2*np.pi/min(self.omega):.3f} s\n"
-        info_text += f"\n振幅统计:\n"
-        info_text += f"最大振幅: {max_amp:.6f} rad\n"
-        info_text += f"最大振幅频率: {omega_max:.3f} rad/s\n"
-        info_text += f"半功率振幅: {half_power_amp:.6f} rad\n"
-        info_text += f"\n相位统计:\n"
-        info_text += f"相位范围: {min(self.phase):.3f} - {max(self.phase):.3f} rad\n"
-        if max_amp_idx < len(self.phase):
-            info_text += f"共振点相位: {self.phase[max_amp_idx]:.3f} rad\n"
+        # 相位 (计算出弧度 -> 转角度)
+        # 注意：理论公式通常给出正值的相位滞后，或者数学上的相角。
+        # 目标图中相位为负值 (0 到 -180)，表示滞后。
+        # 标准物理公式 arctan2(y, x) 在共振时为 pi/2。
+        # 我们将其取负并转换为度数，以匹配 "Phase Difference (deg)" 为负的习惯
+        phase_theory_rad = self.phase_func(omega_dense, omega0, beta)
+        phase_theory_deg = -np.degrees(phase_theory_rad) 
         
-        ax2.text(0.1, 0.5, info_text, fontsize=11, 
-                verticalalignment='center',
-                bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
+        # 3. 处理实验数据的坐标
+        # 横坐标：归一化频率 lambda
+        lambda_data = self.omega / omega0
+        lambda_plot = omega_dense / omega0
+        
+        # 纵坐标：
+        # 幅值直接使用 self.amp_deg
+        # 相位需要根据实验数据的记录方式调整。
+        # 假设输入数据 phi 是正值 (0~180)，我们在图中显示为负值以表示滞后
+        # 如果原始数据已经是负的，则不需要加负号。这里假设原始数据记录的是滞后量的绝对值。
+        phase_data_plot = -np.abs(self.phase_deg) 
+
+        # 4. 开始绘图
+        plt.figure(figsize=(12, 5))
+        
+        # === 子图1：幅频特性 ===
+        plt.subplot(1, 2, 1)
+        # 实验数据点
+        plt.scatter(lambda_data, self.amp_deg, color='black', label='Exp Data', s=30, zorder=3, marker='x')
+        # 理论曲线
+        plt.plot(lambda_plot, amp_theory_deg, 'r--', label='Physics Theory', linewidth=2)
+        
+        plt.title('Amplitude-Frequency Response')
+        plt.xlabel(r'Frequency Ratio $\lambda = \omega / \omega_0$')
+        plt.ylabel(r'Amplitude $\theta$ (deg)')
+        plt.axvline(1.0, color='gray', linestyle=':', alpha=0.5, label='Resonance')
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.5)
+        
+        # === 子图2：相频特性 ===
+        plt.subplot(1, 2, 2)
+        # 实验数据点
+        plt.scatter(lambda_data, phase_data_plot, color='black', label='Exp Data', s=30, zorder=3, marker='x')
+        # 理论曲线
+        plt.plot(lambda_plot, phase_theory_deg, 'r--', label='Physics Theory', linewidth=2)
+        
+        plt.title('Phase-Frequency Response')
+        plt.xlabel(r'Frequency Ratio $\lambda = \omega / \omega_0$')
+        plt.ylabel(r'Phase Difference $\phi$ (deg)')
+        plt.axvline(1.0, color='gray', linestyle=':', alpha=0.5)
+        # 设置Y轴范围，通常相位在 0 到 -180 之间
+        plt.ylim(-190, 10)
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.5)
         
         plt.tight_layout()
         plt.show()
 
+# ==========================================
+# 辅助函数：创建一个测试用的 Excel 文件
+# (如果你已有文件，可以忽略此部分)
+# ==========================================
+def create_dummy_excel(filename="vibration_data.xlsx"):
+    data = {
+        'theta': [37.5, 45.5, 52.5, 61.5, 69.5, 77.5, 86.5, 96.5, 105, 115.5, 
+                  126, 131, 131, 131, 131, 131, 127.5, 116.5, 105.5, 96.5],
+        'T': [1.643, 1.658, 1.668, 1.678, 1.686, 1.692, 1.698, 1.704, 1.709, 1.715, 
+              1.722, 1.72, 1.731, 1.73, 1.732, 1.733, 1.737, 1.746, 1.753, 1.758],
+        'phi': [164, 161, 157, 153, 149, 144, 139, 134, 128, 119, 
+                107, 95, 90, 92, 88, 86, 73, 64, 55, 49]
+    }
+    df = pd.DataFrame(data)
+    # 注意：原始数据的phi随着omega增加(T减小)而减小，
+    # 这可能意味着记录的是相位"导前"或者与标准定义的角度互补。
+    # 标准受迫振动：omega增加 -> 相位滞后增加 (0 -> 90 -> 180)。
+    # 这里的 phi 看起来像是 180 - lag。为了演示效果，代码会自动拟合。
+    
+    df.to_excel(filename, index=False)
+    print(f"已创建测试文件: {filename}")
 
+# ==========================================
+# 主程序
+# ==========================================
 def main():
-    # 您的数据
-    data_string = """theta	T	phi
-37.5	1.643	164
-45.5	1.658	161
-52.5	1.668	157
-61.5	1.678	153
-69.5	1.686	149
-77.5	1.692	144
-86.5	1.698	139
-96.5	1.704	134
-105	1.709	128
-115.5	1.715	119
-126	1.722	107
-131	1.72	95
-131	1.731	90
-131	1.73	92
-131	1.732	88
-131	1.733	86
-127.5	1.737	73
-116.5	1.746	64
-105.5	1.753	55
-96.5	1.758	49"""
+    # 文件路径
+    excel_file = 'ExperimentData.xlsx'
     
     print("="*60)
-    print("受迫振动数据分析")
+    print("受迫振动数据分析 (Excel模式)")
     print("="*60)
     
-    # 1. 加载数据
-    data_loader = DataLoader(data_string)
-    omega, amplitude, phase = data_loader.processData()
-    
-    print("\n原始数据转换结果:")
-    print(f"角频率 ω (rad/s): {omega}")
-    print(f"振幅 A (rad): {amplitude}")
-    print(f"相位 φ (rad): {phase}")
-    
-    # 2. 创建分析器
-    analyzer = ForcedVibrationAnalyzer(omega, amplitude, phase)
-    
-    # 3. 分析共振区域
-    print("\n" + "="*60)
-    print("开始分析共振区域和半功率带")
-    print("="*60)
-    
-    results = analyzer.analyze_resonance_region()
-    
-    if results:
-        print("\n" + "="*60)
-        print("分析结果总结")
-        print("="*60)
-        for key, value in results.items():
-            if isinstance(value, float):
-                print(f"{key}: {value:.6f}")
-            else:
-                print(f"{key}: {value}")
-    
-    # 4. 绘制图形
-    print("\n" + "="*60)
-    print("绘制分析图形")
-    print("="*60)
-    
-    analyzer.plot_amplitude_phase()
-    analyzer.plot_detailed_analysis()
-    
-    return analyzer
-
+    try:
+        # 2. 加载数据
+        loader = DataLoader(excel_file)
+        loader.load_data()
+        omega, amp_rad, phi_rad, amp_deg, phi_deg = loader.process_data()
+        
+        # 3. 初始化分析器
+        analyzer = ForcedVibrationAnalyzer(omega, amp_rad, phi_rad, amp_deg, phi_deg)
+        
+        # 4. 执行拟合与绘图
+        analyzer.fit_parameters()
+        analyzer.visualize_like_target()
+        
+    except Exception as e:
+        print(f"程序运行出错: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
-    analyzer = main()
+    main()

@@ -21,7 +21,7 @@ class ForceViberationModel(nn.Module):
         real_k = self.J_fixed * (omega_peak_data ** 2)
         
         # 初始 c 设为临界阻尼的 5% (保证有明显的尖峰)
-        real_c = 0.0 * (2 * np.sqrt(self.J_fixed * real_k))
+        real_c = 0.02 * (2 * np.sqrt(self.J_fixed * real_k))
         
         # --- 关键：根据物理公式推算 M0 ---
         # Theta_max = M0 / (c * omega_peak) -> M0 = Theta_max * c * omega_peak
@@ -98,7 +98,7 @@ class PINNLoss():
         # 阻尼比 delta = c / (2*sqrt(J*k))，我们希望它保持在欠阻尼状态 (delta < 1)
         reg_loss = torch.relu(phy_out['delta'] - 0.2) + torch.relu(0.05-phy_out['delta'])
 
-        return data_total + 30.0 * (loss_theta_phy + loss_phi_phy) + 15.0 * loss_omega0 + 0.0*reg_loss
+        return data_total + 350.0 * (loss_theta_phy + loss_phi_phy) + 15.0 * loss_omega0 + 0.0*reg_loss
 # --------------------------
 # 2. 修正后的训练器 (差分学习率)
 # --------------------------
@@ -275,53 +275,81 @@ def calculate_delta_from_curve(omega_dense, theta_nn):
     return delta_calc, omega_1, omega_2
     
 def visualize_results(model, train_data):
+    # 1. 提取原始数据
     omega_data = train_data['omega'].detach().cpu().numpy().flatten()
     theta_data = train_data['theta'].detach().cpu().numpy().flatten()
     phi_data = train_data['phi'].detach().cpu().numpy().flatten()
 
+    # 2. 生成用于画图的密集网格
     omega_min = np.min(omega_data) * 0.9
     omega_max = np.max(omega_data) * 1.1
     omega_dense = torch.linspace(omega_min, omega_max, 5000).reshape(-1, 1)
 
+    # 3. 模型预测
     model.eval()
     with torch.no_grad():
         nn_pred = model(omega_dense)
         phy_pred = model.physic_model(omega_dense)
+        
+        # 关键：从物理模型输出中获取当前学习到的固有频率 omega0
+        # phy_pred['omega0'] 是一个张量，所有的值应该是一样的（因为 k 和 J 是常数）
+        omega0_val = phy_pred['omega0'][0].item()
 
-    omega_plot = omega_dense.numpy().flatten()
-    theta_nn = nn_pred['theta'].numpy().flatten()
-    phi_nn = nn_pred['phi'].numpy().flatten()
-    theta_phy = phy_pred['theta'].numpy().flatten()
-    phi_phy = phy_pred['phi'].numpy().flatten()
+    # 4. 数据坐标变换 (Modification Starts Here)
     
+    # --- 横坐标：归一化频率 (omega / omega0) ---
+    omega_ratio_data = omega_data / omega0_val
+    omega_ratio_plot = omega_dense.numpy().flatten() / omega0_val
+    
+    # --- 纵坐标(幅值)：弧度 -> 角度 ---
+    theta_data_deg = np.degrees(theta_data)
+    theta_nn_deg = np.degrees(nn_pred['theta'].numpy().flatten())
+    theta_phy_deg = np.degrees(phy_pred['theta'].numpy().flatten())
+    
+    # --- 纵坐标(相位)：弧度 -> 角度，并取负值表示滞后 ---
+    # 原始模型输出为 [0, pi]，改为 [0, -180] 以符合工程习惯
+    phi_data_deg = -np.degrees(phi_data)
+    phi_nn_deg = -np.degrees(nn_pred['phi'].numpy().flatten())
+    phi_phy_deg = -np.degrees(phy_pred['phi'].numpy().flatten())
+
+    # 5. 绘图
     plt.figure(figsize=(12, 5))
 
+    # === 幅频特性曲线 ===
     plt.subplot(1, 2, 1)
-    plt.scatter(omega_data, theta_data, color='black', label='Exp Data', s=30, zorder=3, marker='x')
-    plt.plot(omega_plot, theta_nn, 'b-', label='NN Prediction', linewidth=2, alpha=0.8)
-    plt.plot(omega_plot, theta_phy, 'r--', label='Physics Theory', linewidth=2)
+    plt.scatter(omega_ratio_data, theta_data_deg, color='black', label='Exp Data', s=30, zorder=3, marker='x')
+    plt.plot(omega_ratio_plot, theta_nn_deg, 'b-', label='NN Prediction', linewidth=2, alpha=0.8)
+    #plt.plot(omega_ratio_plot, theta_phy_deg, 'r--', label='Physics Theory', linewidth=2)
     
     plt.title('Amplitude-Frequency Response')
-    plt.xlabel(r'Angular Frequency $\omega$ (rad/s)')
-    plt.ylabel(r'Amplitude $\theta$ (rad)')
+    plt.xlabel(r'Frequency Ratio $\lambda = \omega / \omega_0$')
+    plt.ylabel(r'Amplitude $\theta$ (deg)') # 单位改为度
+    plt.axvline(1.0, color='gray', linestyle=':', alpha=0.5, label='Resonance') # 标记共振点 lambda=1
     plt.legend()
     plt.grid(True, linestyle='--', alpha=0.5)
 
+    # === 相频特性曲线 ===
     plt.subplot(1, 2, 2)
+    plt.scatter(omega_ratio_data, phi_data_deg, color='black', label='Exp Data', s=30, zorder=3, marker='x')
+    plt.plot(omega_ratio_plot, phi_nn_deg, 'b-', label='NN Prediction', linewidth=2, alpha=0.8)
+    #plt.plot(omega_ratio_plot, phi_phy_deg, 'r--', label='Physics Theory', linewidth=2)
 
-    plt.scatter(omega_data, phi_data, color='black', label='Exp Data', s=30, zorder=3, marker='x')
-    plt.plot(omega_plot, phi_nn, 'b-', label='NN Prediction', linewidth=2, alpha=0.8)
-    plt.plot(omega_plot, phi_phy, 'r--', label='Physics Theory', linewidth=2)
-
-    delta_img, w1, w2 = calculate_delta_from_curve(omega_plot, theta_nn)
-    print(f"--- 图像提取分析 ---")
-    print(f"基于拟合曲线计算的阻尼比 Delta: {delta_img:.4f}")
-    
     plt.title('Phase-Frequency Response')
-    plt.xlabel(r'Angular Frequency $\omega$ (rad/s)')
-    plt.ylabel(r'Phase $\phi$ (rad)')
+    plt.xlabel(r'Frequency Ratio $\lambda = \omega / \omega_0$')
+    plt.ylabel(r'Phase Difference $\phi$ (deg)') # 单位改为度，且数值为负
+    plt.axvline(1.0, color='gray', linestyle=':', alpha=0.5)
     plt.legend()
     plt.grid(True, linestyle='--', alpha=0.5)
+
+    # 6. 计算阻尼比 (保持使用原始物理量计算，保证精度)
+    # 传入原始的 omega (rad/s) 和 theta (rad) 给计算函数
+    omega_raw_plot = omega_dense.numpy().flatten()
+    theta_raw_nn = nn_pred['theta'].numpy().flatten()
+    delta_img, w1, w2 = calculate_delta_from_curve(omega_raw_plot, theta_raw_nn)
+    
+    print(f"--- 图像提取分析 ---")
+    print(f"学习到的固有频率 Omega0: {omega0_val:.4f} rad/s")
+    print(f"基于拟合曲线计算的阻尼比 Delta: {delta_img:.4f}")
     
     plt.tight_layout()
     plt.show()
